@@ -86,7 +86,7 @@ def generate_report(df):
 
 def run_scraper():
     export_files = [
-        "Property Export All+Saved+Properties.xlsx",
+        "Property_Export_All_Saved_Properties.xlsx",
         "propstream_export.xlsx",
         "export.xlsx"
     ]
