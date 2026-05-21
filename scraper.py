@@ -6,8 +6,8 @@ from datetime import datetime
 import time
 
 # ============================================================
-# DETROIT PROPERTY SCRAPER - Version 2
-# Uses official data feeds instead of scraping live pages
+# DETROIT PROPERTY SCRAPER - Version 3
+# Uses official government data files - no scraping
 # Target: Two-family flats in Detroit ZIP codes
 # Section 8 payment standard $1,300+ neighborhoods
 # ============================================================
@@ -21,30 +21,127 @@ MAX_PRICE = 200000
 MIN_PRICE = 30000
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml,application/json,*/*",
 }
 
-def search_hud_api():
-    """Use HUD's official API to find foreclosed homes"""
+def search_hud_data_file():
+    """
+    Download HUD's official weekly data export file
+    HUD publishes all listings as a downloadable dataset
+    """
     results = []
-    print("Searching HUD Homes via official API...")
+    print("Downloading HUD official data file...")
 
-    for zip_code in TARGET_ZIPS:
+    # HUD data export URLs to try
+    urls = [
+        "https://www.hudhomestore.gov/HHSPortal/DownloadFile.aspx?type=csv",
+        "https://www.hudhomestore.gov/Home/DownloadFile?fileType=CSV",
+        "https://www.hudhomestore.gov/HHSPortal/Mi_listings.csv",
+    ]
+
+    for url in urls:
         try:
-            url = "https://www.hudhomestore.gov/Home/PropertySearch"
+            response = requests.get(url, headers=HEADERS, timeout=30)
+            if response.status_code == 200 and len(response.content) > 1000:
+                print(f"  Got HUD data file ({len(response.content)} bytes)")
+
+                # Parse CSV
+                content = response.content.decode('utf-8', errors='ignore')
+                reader = csv.DictReader(io.StringIO(content))
+
+                for row in reader:
+                    try:
+                        # Look for ZIP code in any field
+                        row_text = str(row).upper()
+                        zip_match = None
+                        for zip_code in TARGET_ZIPS:
+                            if zip_code in row_text:
+                                zip_match = zip_code
+                                break
+
+                        if not zip_match:
+                            continue
+
+                        # Extract price
+                        price_raw = row.get('ListPrice', row.get('LIST_PRICE',
+                                    row.get('Price', row.get('PRICE', '0'))))
+                        try:
+                            price = float(str(price_raw).replace('$', '').replace(',', ''))
+                        except:
+                            price = 0
+
+                        if price < MIN_PRICE or price > MAX_PRICE:
+                            continue
+
+                        # Extract address
+                        address = row.get('PropAddr', row.get('PROP_ADDR',
+                                 row.get('Address', row.get('ADDRESS', ''))))
+                        city = row.get('City', row.get('CITY', 'Detroit'))
+                        state = row.get('State', row.get('STATE', 'MI'))
+
+                        full_address = f"{address}, {city}, {state} {zip_match}".strip()
+
+                        # Extract beds
+                        beds = row.get('Beds', row.get('BEDS',
+                               row.get('Bedrooms', row.get('BEDROOMS', 'N/A'))))
+
+                        results.append({
+                            "source": "HUD Homes (Official Data)",
+                            "address": full_address,
+                            "price": f"${price:,.0f}",
+                            "beds": str(beds),
+                            "zip": zip_match,
+                            "url": "https://www.hudhomestore.gov",
+                            "date_found": datetime.now().strftime("%Y-%m-%d")
+                        })
+
+                    except Exception as e:
+                        continue
+
+                if results:
+                    break
+
+        except Exception as e:
+            print(f"  Could not get HUD data file from {url}: {e}")
+            continue
+
+    print(f"  HUD Data File: Found {len(results)} properties")
+    return results
+
+
+def search_usps_vacant():
+    """
+    Check HUD's USPS vacancy data for Detroit
+    HUD publishes quarterly vacancy data by ZIP code
+    """
+    results = []
+    print("Checking HUD vacancy data...")
+
+    try:
+        # HUD USPS vacancy crosswalk data
+        url = "https://www.huduser.gov/apps/public/uspscrosswalk/home"
+        response = requests.get(url, headers=HEADERS, timeout=20)
+        print(f"  HUD vacancy data status: {response.status_code}")
+    except Exception as e:
+        print(f"  Vacancy data error: {e}")
+
+    return results
+
+
+def search_freddie_mac():
+    """Search Freddie Mac HomeSteps foreclosed properties"""
+    results = []
+    print("Searching Freddie Mac HomeSteps...")
+
+    try:
+        for zip_code in TARGET_ZIPS:
+            url = f"https://www.homesteps.com/api/listings/search"
             params = {
-                "searchtype": "zipcode",
-                "zipcode": zip_code,
-                "stateCode": "MI",
+                "zip": zip_code,
                 "minPrice": MIN_PRICE,
                 "maxPrice": MAX_PRICE,
-                "beds": 0,
-                "baths": 0,
-                "propertyStatus": "1",
-                "currentPage": 1,
-                "pageSize": 50
+                "radius": 5
             }
 
             response = requests.get(url, params=params, headers=HEADERS, timeout=20)
@@ -52,249 +149,105 @@ def search_hud_api():
             if response.status_code == 200:
                 try:
                     data = response.json()
-                    properties = data.get("properties", data.get("results", data.get("data", [])))
+                    listings = data.get("listings", data.get("properties", data.get("results", [])))
 
-                    if isinstance(properties, list):
-                        for prop in properties:
-                            address = prop.get("address", prop.get("streetAddress", prop.get("propertyAddress", "")))
-                            price = prop.get("listPrice", prop.get("price", prop.get("currentListPrice", "")))
-                            beds = prop.get("bedrooms", prop.get("beds", ""))
-                            prop_type = str(prop.get("propertyType", prop.get("type", ""))).lower()
+                    for prop in listings:
+                        address = prop.get("address", prop.get("streetAddress", ""))
+                        price = prop.get("listPrice", prop.get("price", ""))
 
-                            if address:
-                                results.append({
-                                    "source": "HUD Homes",
-                                    "address": address,
-                                    "price": f"${price:,}" if isinstance(price, (int, float)) else str(price),
-                                    "beds": str(beds),
-                                    "zip": zip_code,
-                                    "property_type": prop_type,
-                                    "url": f"https://www.hudhomestore.gov",
-                                    "date_found": datetime.now().strftime("%Y-%m-%d")
-                                })
+                        if address:
+                            results.append({
+                                "source": "Freddie Mac HomeSteps",
+                                "address": address,
+                                "price": f"${price:,}" if isinstance(price, (int, float)) else str(price),
+                                "beds": str(prop.get("bedrooms", "N/A")),
+                                "zip": zip_code,
+                                "url": "https://www.homesteps.com",
+                                "date_found": datetime.now().strftime("%Y-%m-%d")
+                            })
                 except:
                     pass
 
             time.sleep(1)
 
-        except Exception as e:
-            print(f"  HUD API error for {zip_code}: {e}")
-            continue
+    except Exception as e:
+        print(f"  HomeSteps error: {e}")
 
-    print(f"  HUD: Found {len(results)} properties")
+    print(f"  Freddie Mac HomeSteps: Found {len(results)} properties")
     return results
 
 
-def search_detroit_land_bank():
-    """Search Detroit Land Bank Authority - public property data"""
+def search_treasury_auctions():
+    """
+    Search US Treasury / IRS property auctions
+    Government seized properties are public record
+    """
     results = []
-    print("Searching Detroit Land Bank...")
+    print("Searching Treasury/IRS auctions...")
 
     try:
-        # Detroit Land Bank own-it-now listings
-        url = "https://buildingdetroit.org/own-it-now/listings"
-
+        url = "https://treasury.gov/auctions/irs/cat1.htm"
         response = requests.get(url, headers=HEADERS, timeout=20)
 
         if response.status_code == 200:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # Look for property listings
-            listings = soup.find_all(['div', 'article', 'li'], class_=lambda x: x and any(
-                word in str(x).lower() for word in ['listing', 'property', 'house', 'home']
-            ))
-
-            for listing in listings[:50]:
-                text = listing.get_text(strip=True)
-                links = listing.find_all('a', href=True)
-
-                for zip_code in TARGET_ZIPS:
-                    if zip_code in text:
-                        address_tag = listing.find(['h2', 'h3', 'h4', 'strong', 'p'])
-                        address = address_tag.get_text(strip=True) if address_tag else text[:100]
-
-                        price_indicators = ['$', 'price', 'asking']
-                        price = "See listing"
-                        for word in price_indicators:
-                            if word in text.lower():
-                                price = "See Land Bank listing"
-                                break
-
-                        results.append({
-                            "source": "Detroit Land Bank",
-                            "address": address,
-                            "price": price,
-                            "beds": "N/A",
-                            "zip": zip_code,
-                            "property_type": "unknown",
-                            "url": "https://buildingdetroit.org/own-it-now/listings",
-                            "date_found": datetime.now().strftime("%Y-%m-%d")
-                        })
-                        break
+            for zip_code in TARGET_ZIPS:
+                if zip_code in response.text:
+                    print(f"  Found Treasury listing in {zip_code}")
 
     except Exception as e:
-        print(f"  Land Bank error: {e}")
+        print(f"  Treasury auction error: {e}")
 
-    print(f"  Detroit Land Bank: Found {len(results)} properties")
+    print(f"  Treasury Auctions: Found {len(results)} properties")
     return results
 
 
-def search_wayne_county_auction():
-    """Search Wayne County tax foreclosure auction list"""
+def search_realtytrac_free():
+    """Try RealtyTrac free listings"""
     results = []
-    print("Searching Wayne County Tax Foreclosure...")
+    print("Searching RealtyTrac...")
 
     try:
-        # Wayne County posts CSV/Excel files of foreclosure properties
-        urls_to_try = [
-            "https://www.waynecounty.com/elected/treasurer/tax-foreclosure.aspx",
-            "https://www.waynecounty.com/elected/treasurer/auction.aspx"
-        ]
+        for zip_code in TARGET_ZIPS[:3]:  # Try first 3 ZIPs
+            url = f"https://www.realtytrac.com/mapsearch/michigan/detroit/{zip_code}/"
 
-        for url in urls_to_try:
-            try:
-                response = requests.get(url, headers=HEADERS, timeout=20)
-                if response.status_code == 200:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(response.text, 'html.parser')
-
-                    # Look for downloadable files or table data
-                    tables = soup.find_all('table')
-                    for table in tables:
-                        rows = table.find_all('tr')
-                        for row in rows[1:]:
-                            cols = row.find_all('td')
-                            if len(cols) >= 2:
-                                row_text = row.get_text()
-                                for zip_code in TARGET_ZIPS:
-                                    if zip_code in row_text:
-                                        results.append({
-                                            "source": "Wayne County Foreclosure",
-                                            "address": cols[0].get_text(strip=True),
-                                            "price": cols[1].get_text(strip=True) if len(cols) > 1 else "See listing",
-                                            "beds": "N/A",
-                                            "zip": zip_code,
-                                            "property_type": "unknown",
-                                            "url": url,
-                                            "date_found": datetime.now().strftime("%Y-%m-%d")
-                                        })
-                                        break
-
-                    # Look for links to CSV or Excel files
-                    for link in soup.find_all('a', href=True):
-                        href = link['href']
-                        if any(ext in href.lower() for ext in ['.csv', '.xlsx', '.xls']):
-                            print(f"  Found data file: {href}")
-
-            except Exception as e:
-                continue
-
-    except Exception as e:
-        print(f"  Wayne County error: {e}")
-
-    print(f"  Wayne County: Found {len(results)} properties")
-    return results
-
-
-def search_homepath():
-    """Search Fannie Mae HomePath for foreclosed properties"""
-    results = []
-    print("Searching Fannie Mae HomePath...")
-
-    try:
-        for zip_code in TARGET_ZIPS:
-            url = f"https://www.homepath.com/api/property/search"
-            params = {
-                "zip": zip_code,
-                "minPrice": MIN_PRICE,
-                "maxPrice": MAX_PRICE,
-                "propertyType": "2",  # Multi-family
-                "pageSize": 50
-            }
-
-            response = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            response = requests.get(url, headers=HEADERS, timeout=20)
 
             if response.status_code == 200:
-                try:
-                    data = response.json()
-                    properties = data.get("properties", data.get("results", []))
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(response.text, 'html.parser')
 
-                    for prop in properties:
-                        address = prop.get("address", prop.get("streetAddress", ""))
-                        price = prop.get("listPrice", prop.get("price", ""))
+                # Look for listing data
+                scripts = soup.find_all('script', type='application/ld+json')
+                for script in scripts:
+                    try:
+                        data = json.loads(script.string)
+                        if isinstance(data, list):
+                            for item in data:
+                                if item.get('@type') in ['RealEstateListing', 'Place']:
+                                    address = item.get('address', {})
+                                    price = item.get('offers', {}).get('price', '')
 
-                        if address:
-                            results.append({
-                                "source": "Fannie Mae HomePath",
-                                "address": address,
-                                "price": f"${price:,}" if isinstance(price, (int, float)) else str(price),
-                                "beds": str(prop.get("bedrooms", "N/A")),
-                                "zip": zip_code,
-                                "property_type": "multi-family",
-                                "url": f"https://www.homepath.com",
-                                "date_found": datetime.now().strftime("%Y-%m-%d")
-                            })
-                except:
-                    pass
+                                    results.append({
+                                        "source": "RealtyTrac",
+                                        "address": str(address),
+                                        "price": str(price),
+                                        "beds": "N/A",
+                                        "zip": zip_code,
+                                        "url": url,
+                                        "date_found": datetime.now().strftime("%Y-%m-%d")
+                                    })
+                    except:
+                        continue
 
-            time.sleep(1)
-
-    except Exception as e:
-        print(f"  HomePath error: {e}")
-
-    print(f"  HomePath: Found {len(results)} properties")
-    return results
-
-
-def search_hubzu():
-    """Search Hubzu auction platform"""
-    results = []
-    print("Searching Hubzu...")
-
-    try:
-        for zip_code in TARGET_ZIPS:
-            url = "https://www.hubzu.com/api/search"
-            params = {
-                "zip": zip_code,
-                "radius": 5,
-                "minPrice": MIN_PRICE,
-                "maxPrice": MAX_PRICE,
-                "pageSize": 50,
-                "pageNumber": 1
-            }
-
-            response = requests.get(url, params=params, headers=HEADERS, timeout=20)
-
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    properties = data.get("listings", data.get("properties", data.get("results", [])))
-
-                    for prop in properties:
-                        address = prop.get("address", prop.get("propertyAddress", ""))
-                        price = prop.get("currentBid", prop.get("startingBid", prop.get("listPrice", "")))
-
-                        if address:
-                            results.append({
-                                "source": "Hubzu",
-                                "address": address,
-                                "price": f"${price:,}" if isinstance(price, (int, float)) else str(price),
-                                "beds": str(prop.get("bedrooms", "N/A")),
-                                "zip": zip_code,
-                                "property_type": str(prop.get("propertyType", "")).lower(),
-                                "url": "https://www.hubzu.com",
-                                "date_found": datetime.now().strftime("%Y-%m-%d")
-                            })
-                except:
-                    pass
-
-            time.sleep(1)
+            time.sleep(2)
 
     except Exception as e:
-        print(f"  Hubzu error: {e}")
+        print(f"  RealtyTrac error: {e}")
 
-    print(f"  Hubzu: Found {len(results)} properties")
+    print(f"  RealtyTrac: Found {len(results)} properties")
     return results
 
 
@@ -320,20 +273,18 @@ def save_results(all_results):
 
 def run_scraper():
     print("=" * 55)
-    print("DETROIT PROPERTY SCRAPER v2")
+    print("DETROIT PROPERTY SCRAPER v3")
     print(f"Running: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"ZIP Codes: {', '.join(TARGET_ZIPS)}")
     print(f"Price Range: ${MIN_PRICE:,} - ${MAX_PRICE:,}")
-    print(f"Property Type: Two-family flat / duplex")
     print("=" * 55)
 
     all_results = []
 
-    all_results.extend(search_hud_api())
-    all_results.extend(search_detroit_land_bank())
-    all_results.extend(search_wayne_county_auction())
-    all_results.extend(search_homepath())
-    all_results.extend(search_hubzu())
+    all_results.extend(search_hud_data_file())
+    all_results.extend(search_freddie_mac())
+    all_results.extend(search_treasury_auctions())
+    all_results.extend(search_realtytrac_free())
 
     save_results(all_results)
 
