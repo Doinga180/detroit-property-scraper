@@ -17,7 +17,7 @@ TARGET_ZIPS = [
 TARGET_TYPES = ["duplex", "multi-family", "two family", "2 units", "flat", "2+"]
 
 # Direct download URL from GitHub
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/Doinga180/detroit-property-scraper/main/Property_Export_All_Saved_Properties.xlsx"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/Doinga180/detroit-property-scraper/main/Property%20Export%20All+Saved+Properties.xlsx"
 
 def read_propstream_export():
     print("Downloading PropStream export from GitHub...")
