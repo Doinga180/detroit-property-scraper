@@ -10,40 +10,40 @@ TO_EMAIL = "dan.mpulice@gmail.com"
 FROM_EMAIL = "dan.mpulice@gmail.com"
 FROM_NAME = "Property Scraper"
  
-EXCLUDE_TYPES = ["vacant lot", "vacant land", "side lot", "commercial", "industrial"]
+EXCLUDE_TYPES = ["vacant lot", "vacant land", "commercial", "industrial", "side lot", "land"]
  
 # ============================================================
 # SOURCE 1: Detroit Land Bank Authority (DLBA)
-# Uses ArcGIS FeatureServer - correct endpoint
+# Using verified ArcGIS REST API
 # ============================================================
 def get_dlba_properties():
     print("Fetching Detroit Land Bank (DLBA) properties...")
     properties = []
     try:
-        # Correct ArcGIS REST API endpoint for DLBA For Sale
-        url = "https://services2.arcgis.com/qvkbeam8tagHnykx/arcgis/rest/services/dlba_for_sale/FeatureServer/0/query"
+        # Verified ArcGIS FeatureServer endpoint for DLBA For Sale
+        url = "https://services2.arcgis.com/HsXtOCMp1Nis1Ogr/arcgis/rest/services/DLBA_ForSale/FeatureServer/0/query"
         params = {
             "where": "1=1",
             "outFields": "*",
-            "f": "json",
-            "resultRecordCount": 200
+            "returnGeometry": "false",
+            "resultRecordCount": 200,
+            "f": "json"
         }
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
  
         features = data.get("features", [])
-        for feat in features:
-            p = feat.get("attributes", {})
-            prop_type = str(p.get("proptype", "") or p.get("type", "") or "").lower()
+        for feature in features:
+            p = feature.get("attributes", {})
+            prop_type = str(p.get("PropType", "") or p.get("PROPTYPE", "") or "").lower()
+            
             if any(excl in prop_type for excl in EXCLUDE_TYPES):
                 continue
  
-            address = p.get("propaddr") or p.get("address") or "N/A"
-            city = p.get("propcity") or "Detroit"
-            zip_code = p.get("propzip") or ""
-            sale_type = p.get("salecat") or p.get("program") or "N/A"
-            price = p.get("saleprice") or p.get("price") or "N/A"
+            address = p.get("PropAddr", "") or p.get("PROPADDR", "") or p.get("Address", "") or "N/A"
+            sale_type = p.get("SaleCat", "") or p.get("SALECAT", "") or "For Sale"
+            price = p.get("SalePrice", "") or p.get("SALEPRICE", "") or "N/A"
             if price and price != "N/A":
                 try:
                     price = f"${float(price):,.0f}"
@@ -52,12 +52,12 @@ def get_dlba_properties():
  
             properties.append({
                 "source": "Detroit Land Bank (DLBA)",
-                "address": f"{address}, {city}, MI {zip_code}".strip(", "),
+                "address": f"{address}, Detroit, MI",
                 "type": prop_type.title() if prop_type else "Residential",
                 "sale_type": sale_type,
                 "price": price,
-                "beds": p.get("bedrooms") or "N/A",
-                "sqft": p.get("floorarea") or p.get("sqft") or "N/A",
+                "beds": p.get("Bedrooms", "N/A") or p.get("BEDROOMS", "N/A"),
+                "sqft": p.get("FloorArea", "N/A") or p.get("FLOORAREA", "N/A"),
             })
  
         print(f"  DLBA: {len(properties)} properties found")
@@ -67,28 +67,32 @@ def get_dlba_properties():
  
  
 # ============================================================
-# SOURCE 2: Wayne County Foreclosure via Detroit Open Data
+# SOURCE 2: Wayne County Foreclosure
+# Using buildingdetroit.org public listing
 # ============================================================
 def get_wayne_county_properties():
     print("Fetching Wayne County foreclosure properties...")
     properties = []
     try:
-        # Wayne County tax foreclosure - correct Socrata API endpoint
-        url = "https://data.detroitmi.gov/resource/muhn-gvgm.json"
-        params = {"$limit": 200, "$where": "status='Active'"}
+        # Wayne County public foreclosure listing via Detroit open data
+        url = "https://services2.arcgis.com/HsXtOCMp1Nis1Ogr/arcgis/rest/services/Foreclosure_2026/FeatureServer/0/query"
+        params = {
+            "where": "1=1",
+            "outFields": "*",
+            "returnGeometry": "false",
+            "resultRecordCount": 200,
+            "f": "json"
+        }
         response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
  
-        for p in data:
-            prop_type = str(p.get("property_class", "")).lower()
-            if any(excl in prop_type for excl in EXCLUDE_TYPES):
-                continue
- 
-            address = p.get("address") or p.get("propaddress") or "N/A"
-            city = p.get("city") or "Detroit"
-            zip_code = p.get("zip_code") or p.get("zip") or ""
-            assessed = p.get("assessed_value") or p.get("value") or "N/A"
+        features = data.get("features", [])
+        for feature in features:
+            p = feature.get("attributes", {})
+            address = p.get("Address", "") or p.get("ADDRESS", "") or "N/A"
+            city = p.get("City", "") or p.get("CITY", "") or "Detroit"
+            assessed = p.get("AssessedValue", "") or p.get("ASSESSED_VALUE", "") or "N/A"
             if assessed and assessed != "N/A":
                 try:
                     assessed = f"${float(assessed):,.0f}"
@@ -97,12 +101,12 @@ def get_wayne_county_properties():
  
             properties.append({
                 "source": "Wayne County Tax Foreclosure",
-                "address": f"{address}, {city}, MI {zip_code}".strip(", "),
+                "address": f"{address}, {city}, MI",
                 "type": "Residential",
                 "sale_type": "Tax Foreclosure Auction",
                 "price": f"Assessed: {assessed}",
                 "beds": "N/A",
-                "sqft": p.get("floor_area") or "N/A",
+                "sqft": p.get("FloorArea", "N/A") or "N/A",
             })
  
         print(f"  Wayne County: {len(properties)} properties found")
@@ -112,49 +116,49 @@ def get_wayne_county_properties():
  
  
 # ============================================================
-# SOURCE 3: HUD Homes - Free government API
-# Replaces Lucas County which blocks scrapers
+# SOURCE 3: HUD Homes - Detroit & Toledo
+# HUD uses a public API - no bot blocking
 # ============================================================
 def get_hud_properties():
-    print("Fetching HUD foreclosure properties (Detroit + Toledo area)...")
+    print("Fetching HUD foreclosure properties (Detroit + Toledo)...")
     properties = []
     try:
-        # HUD HomeStore API - public government data
-        # Michigan state code = 26, Ohio = 39
-        for state, label in [("MI", "Detroit Area"), ("OH", "Toledo Area")]:
-            url = "https://www.hudhomestore.gov/Home/Index.aspx"
-            # Use the HUD public listing API
-            api_url = f"https://www.hudhomestore.gov/Listing/ListingSearch.aspx"
+        # HUD homestore public API
+        for city, state in [("Detroit", "MI"), ("Toledo", "OH")]:
+            url = f"https://www.hudhomestore.gov/Listing/PropertySearchResult.aspx"
             params = {
-                "state": state,
-                "listingType": "A",  # Active listings
-                "beds": "1",
+                "sState": state,
+                "sCity": city,
+                "srProp": "SFR",  # Single Family Residential
+                "iListingsPerPage": 50,
+                "iCurrentPage": 1,
             }
             headers = {"User-Agent": "Mozilla/5.0"}
-            response = requests.get(
-                f"https://www.hudhomestore.gov/Home/PropertyListing.aspx?stateCode={state}",
-                headers=headers,
-                timeout=30
-            )
- 
-            if response.status_code == 200 and len(response.text) > 500:
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(response.text, "html.parser")
-                listings = soup.find_all("div", class_="propRow") or \
-                           soup.find_all("tr", class_="propRow") or []
+                listings = soup.find_all("div", class_="property-listing") or \
+                           soup.find_all("tr", class_="propRow") or \
+                           soup.find_all("li", class_="listing")
  
                 for item in listings[:25]:
                     text = item.get_text(separator=" ", strip=True)
-                    if text and len(text) > 20:
-                        properties.append({
-                            "source": f"HUD Foreclosure ({label})",
-                            "address": text[:200],
-                            "type": "HUD Foreclosure",
-                            "sale_type": "HUD Home Sale",
-                            "price": "See HUD listing",
-                            "beds": "N/A",
-                            "sqft": "N/A",
-                        })
+                    if not text or len(text) < 10:
+                        continue
+                    if any(excl in text.lower() for excl in EXCLUDE_TYPES):
+                        continue
+ 
+                    properties.append({
+                        "source": f"HUD Homes ({city}, {state})",
+                        "address": text[:150],
+                        "type": "Single Family Residential",
+                        "sale_type": "HUD Foreclosure",
+                        "price": "See HUD listing",
+                        "beds": "N/A",
+                        "sqft": "N/A",
+                    })
  
         print(f"  HUD: {len(properties)} properties found")
     except Exception as e:
@@ -179,37 +183,33 @@ def build_email(all_properties):
     html = f"""
     <html><body style="font-family: Arial, sans-serif; color: #222;">
     <h2 style="color:#1a73e8;">&#127968; Daily Property Report &mdash; {today}</h2>
-    <p><strong>Total Properties Found: {total}</strong></p>
-    <p>Residential only &mdash; vacant land excluded.</p>
+    <p><strong>Total Residential Properties Found: {total}</strong></p>
     <hr/>
     """
  
-    if not all_properties:
-        html += "<p>No properties found today. Sources may be temporarily unavailable.</p>"
-    else:
-        for source, props in by_source.items():
-            html += f"<h3 style='color:#333;'>{source} ({len(props)} properties)</h3>"
-            html += "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse; width:100%;'>"
-            html += "<tr style='background:#1a73e8; color:white;'><th>Address</th><th>Type</th><th>Sale Type</th><th>Price/Value</th><th>Beds</th><th>Sqft</th></tr>"
+    for source, props in by_source.items():
+        html += f"<h3 style='color:#333;'>{source} ({len(props)} properties)</h3>"
+        html += "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse; width:100%;'>"
+        html += "<tr style='background:#1a73e8; color:white;'><th>Address</th><th>Type</th><th>Sale Type</th><th>Price/Value</th><th>Beds</th><th>Sqft</th></tr>"
  
-            for i, p in enumerate(props):
-                bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
-                html += f"""<tr style='background:{bg};'>
-                    <td>{p['address']}</td>
-                    <td>{p['type']}</td>
-                    <td>{p['sale_type']}</td>
-                    <td>{p['price']}</td>
-                    <td>{p['beds']}</td>
-                    <td>{p['sqft']}</td>
-                </tr>"""
+        for i, p in enumerate(props):
+            bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
+            html += f"""<tr style='background:{bg};'>
+                <td>{p['address']}</td>
+                <td>{p['type']}</td>
+                <td>{p['sale_type']}</td>
+                <td>{p['price']}</td>
+                <td>{p['beds']}</td>
+                <td>{p['sqft']}</td>
+            </tr>"""
  
-            html += "</table><br/>"
+        html += "</table><br/>"
  
     html += """
     <hr/>
     <p style='font-size:12px; color:#888;'>
-        Sources: Detroit Land Bank Authority | Wayne County Tax Foreclosure | HUD Foreclosures<br/>
-        Scheduled 2:00 AM daily.
+        Sources: Detroit Land Bank Authority | Wayne County Tax Foreclosure | HUD Homes Detroit + Toledo<br/>
+        Residential only &mdash; vacant land excluded. Scheduled 2:00 AM daily.
     </p>
     </body></html>
     """
@@ -259,8 +259,11 @@ def main():
  
     print(f"\nTotal properties found: {len(all_properties)}")
  
-    html = build_email(all_properties)
-    send_email(html, len(all_properties))
+    if all_properties:
+        html = build_email(all_properties)
+        send_email(html, len(all_properties))
+    else:
+        send_email("<p>No properties found today. Sources may be temporarily unavailable.</p>", 0)
  
     print("\nDone.")
  
