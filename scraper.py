@@ -1,5 +1,7 @@
 import requests
 import os
+import re
+import json
 from datetime import datetime, timezone
 
 # ============================================================
@@ -78,6 +80,7 @@ def get_dlba_properties():
             listed = format_date(p.get("listing_date"))
 
             properties.append({
+                "_key": normalize_address(address),
                 "source": "Detroit Land Bank (DLBA)",
                 "address": f"{address}, Detroit, MI" + (f" ({neighborhood})" if neighborhood else ""),
                 "type": "Residential",
@@ -92,6 +95,121 @@ def get_dlba_properties():
         print(f"  DLBA Error: {e}")
         SOURCE_ERRORS.append(f"Detroit Land Bank: {e}")
     return properties
+
+
+# ============================================================
+# OWN IT NOW PRICES (buildingdetroit.org)
+# The city feed has no prices. The Land Bank's Own It Now page
+# carries a block of data called "listingsdata" with name, price,
+# beds, baths and square footage for each house.
+# ============================================================
+OWN_IT_NOW_URL = "https://buildingdetroit.org/properties/ownitnow"
+
+STREET_TYPES = {"st", "street", "ave", "avenue", "rd", "road", "blvd", "boulevard",
+                "dr", "drive", "ct", "court", "pl", "place", "ln", "lane", "pkwy",
+                "parkway", "ter", "terrace", "way", "hwy", "cir", "circle"}
+
+
+def normalize_address(addr):
+    """'11655 Saint Louis St' and '11655 St Louis' both become '11655 st louis'."""
+    words = re.sub(r"[^a-z0-9 ]", " ", str(addr).lower()).split()
+    words = ["st" if w == "saint" else w for w in words]
+    while len(words) > 2 and words[-1] in STREET_TYPES:
+        words.pop()
+    return " ".join(words)
+
+
+def first_value(d, *keys):
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", "0", 0):
+            return v
+    return None
+
+
+def money(v):
+    try:
+        return f"${float(str(v).replace(',', '').replace('$', '')):,.0f}"
+    except (ValueError, TypeError):
+        return str(v)
+
+
+def get_own_it_now_listings():
+    """Returns {normalized address: info} for every Own It Now house on the website."""
+    print("Fetching Own It Now prices from buildingdetroit.org...")
+    results = {}
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (property-scraper)"}
+        response = requests.get(OWN_IT_NOW_URL, headers=headers, timeout=30)
+        response.raise_for_status()
+        html = response.text
+
+        marker = re.search(r"var\s+listingsdata\s*=\s*", html)
+        if not marker:
+            raise RuntimeError("couldn't find 'listingsdata' on the page (site layout changed)")
+        data, _ = json.JSONDecoder().raw_decode(html[marker.end():])
+        listings = data.get("listings") or []
+        pagination = data.get("pagination") or {}
+
+        for item in listings:
+            name = (item.get("property_name") or "").strip()
+            if not name:
+                continue
+            slug = item.get("slug") or re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+            price = first_value(item, "price", "sale_price", "list_price")
+            results[normalize_address(name)] = {
+                "name": name,
+                "price": money(price) if price else "N/A",
+                "beds": first_value(item, "bedrooms", "beds") or "N/A",
+                "baths": first_value(item, "bathrooms", "baths") or "N/A",
+                "sqft": first_value(item, "area", "square_feet", "sqft") or "N/A",
+                "sale_starts": first_value(item, "sale_start_date", "sale_starts_on",
+                                           "start_date", "auction_start_date"),
+                "link": f"https://buildingdetroit.org/properties/{slug}",
+            }
+
+        total = int(pagination.get("total") or len(listings))
+        print(f"  Own It Now: {len(results)} listings with prices (site says {total} total)")
+        if total > len(listings):
+            SOURCE_ERRORS.append(f"Own It Now prices: only got {len(listings)} of {total} listings (more pages)")
+    except Exception as e:
+        print(f"  Own It Now Error: {e}")
+        SOURCE_ERRORS.append(f"Own It Now prices: {e}")
+    return results
+
+
+def add_own_it_now_prices(dlba_properties, oin):
+    """Fill in price/beds/baths/sqft on matching Land Bank houses,
+    and add any Own It Now house the city feed doesn't have yet."""
+    matched = set()
+    for p in dlba_properties:
+        key = p.get("_key")
+        info = oin.get(key)
+        if not info:
+            continue
+        matched.add(key)
+        p["price"] = info["price"]
+        p["beds"] = f"{info['beds']} bd / {info['baths']} ba"
+        p["sqft"] = info["sqft"]
+        p["link"] = info["link"]
+        if info.get("sale_starts"):
+            p["sale_type"] += f" (sale starts {info['sale_starts']})"
+
+    for key, info in oin.items():
+        if key in matched:
+            continue
+        dlba_properties.append({
+            "source": "Detroit Land Bank (DLBA)",
+            "address": f"{info['name']}, Detroit, MI",
+            "type": "Residential",
+            "sale_type": "Own It Now" + (f" (sale starts {info['sale_starts']})" if info.get("sale_starts") else ""),
+            "price": info["price"],
+            "beds": f"{info['beds']} bd / {info['baths']} ba",
+            "sqft": info["sqft"],
+            "link": info["link"],
+        })
+    print(f"  Own It Now: {len(matched)} matched to city feed, {len(oin) - len(matched)} website-only")
+    return dlba_properties
 
 
 # ============================================================
@@ -226,7 +344,7 @@ def build_email(all_properties):
         for i, p in enumerate(props):
             bg = "#f9f9f9" if i % 2 == 0 else "#ffffff"
             html += f"""<tr style='background:{bg};'>
-                <td>{p['address']}</td>
+                <td>{f"<a href='{p['link']}'>{p['address']}</a>" if p.get('link') else p['address']}</td>
                 <td>{p['type']}</td>
                 <td>{p['sale_type']}</td>
                 <td>{p['price']}</td>
@@ -284,7 +402,9 @@ def main():
     print("=" * 60)
 
     all_properties = []
-    all_properties.extend(get_dlba_properties())
+    dlba = get_dlba_properties()
+    dlba = add_own_it_now_prices(dlba, get_own_it_now_listings())
+    all_properties.extend(dlba)
     all_properties.extend(get_wayne_county_properties())
     all_properties.extend(get_hud_properties())
 
